@@ -1,7 +1,13 @@
+import stripe
 import httpx
 import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 app = FastAPI(title="ARBION OS", version="2.4.0")
 
@@ -227,4 +233,48 @@ async def health():
         "items_tracked": len(ITEM_LIST),
         "chunk_size": CHUNK_SIZE,
         "cities": CITIES,
+
     }
+@app.post("/create-checkout")
+async def create_checkout(request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    email = body.get("email")
+
+    session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        mode="subscription",
+        customer_email=email,
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url="https://arbion.netlify.app?payment=success",
+        cancel_url="https://arbion.netlify.app?payment=cancelled",
+        metadata={"user_id": user_id},
+    )
+    return {"url": session.url}
+
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid webhook")
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session["metadata"]["user_id"]
+
+        # Ενημέρωσε τη Supabase
+        from supabase import create_client
+        sb = create_client(
+            "https://znzsttdyeigkfwbvocie.supabase.co",
+            "YOUR_SUPABASE_SERVICE_ROLE_KEY"  # ← όχι το anon key, το service role!
+        )
+        sb.table("profiles").update({"is_pro": True}).eq("id", user_id).execute()
+
+    return {"status": "ok"}
