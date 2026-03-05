@@ -1,8 +1,10 @@
 import stripe
 import httpx
 import asyncio
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request, HTTPException
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
@@ -278,3 +280,4 @@ async def stripe_webhook(request: Request):
         sb.table("profiles").update({"is_pro": True}).eq("id", user_id).execute()
 
     return {"status": "ok"}
+
