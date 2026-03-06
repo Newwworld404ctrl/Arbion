@@ -2,16 +2,16 @@ import stripe
 import httpx
 import asyncio
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Request, HTTPException
 
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+stripe.api_key        = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+STRIPE_PRICE_ID       = "price_1T7KE2KFJRX1avMl9z1D8leJ"
+SUPABASE_URL          = "https://znzsttdyeigkfwbvocie.supabase.co"
+SUPABASE_SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY")
 
-app = FastAPI(title="ARBION OS", version="2.4.0")
+app = FastAPI(title="ARBION OS", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,11 +52,16 @@ BASE_ITEMS = [
     "SHOES_CLOTH_SET1", "SHOES_CLOTH_SET2", "SHOES_CLOTH_SET3",
 ]
 
-CITIES = ["Martlock", "Lymhurst", "Fort Sterling", "Bridgewatch", "Thetford", "Caerleon"]
-MARKET_TAX = 0.06
-MIN_PROFIT = 1500
+CITIES             = ["Martlock", "Lymhurst", "Fort Sterling", "Bridgewatch", "Thetford", "Caerleon"]
+MARKET_TAX         = 0.06
+MIN_PROFIT         = 1500
 MAX_DEALS_PER_CITY = 30
-CHUNK_SIZE = 50  # items per API request — safe for Albion API URL limits
+CHUNK_SIZE         = 50
+
+
+MIN_ITEM_COUNT     = 10   
+LOOKBACK_DAYS      = 3   
+MAX_PRICE_RATIO    = 2.5  
 
 # ── NAME MAPPING ───────────────────────────────────────────────────────────
 TIER_NAMES = {
@@ -123,12 +128,58 @@ def generate_item_list() -> list[str]:
 
 
 ITEM_LIST = generate_item_list()
-CITY_STR = ",".join(CITIES)
+CITY_STR  = ",".join(CITIES)
 
 
 def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
+
+
+# ── SMART PRICE CALCULATION ────────────────────────────────────────────────
+def calculate_smart_price(history: list[dict]) -> float | None:
+    """
+    Υπολογίζει αξιόπιστη τιμή από το history:
+    1. Φιλτράρει εγγραφές με item_count < MIN_ITEM_COUNT (αναξιόπιστες)
+    2. Παίρνει τις τελευταίες LOOKBACK_DAYS μέρες
+    3. Ελέγχει για spikes (τιμές > MAX_PRICE_RATIO * median)
+    4. Επιστρέφει weighted average (βαρύτερες οι πιο πρόσφατες μέρες)
+    """
+    if not history:
+        return None
+
+    
+    valid = [h for h in history if h.get("item_count", 0) >= MIN_ITEM_COUNT and h.get("avg_price", 0) > 0]
+    if not valid:
+        return None
+
+    
+    recent = valid[-LOOKBACK_DAYS:] if len(valid) >= LOOKBACK_DAYS else valid
+    if not recent:
+        return None
+
+    prices = [h["avg_price"] for h in recent]
+
+    sorted_prices = sorted(prices)
+    mid = len(sorted_prices) // 2
+    median = sorted_prices[mid] if len(sorted_prices) % 2 != 0 else (sorted_prices[mid-1] + sorted_prices[mid]) / 2
+
+    filtered = [h for h in recent if h["avg_price"] <= median * MAX_PRICE_RATIO and h["avg_price"] >= median / MAX_PRICE_RATIO]
+    if not filtered:
+        filtered = recent  
+
+   
+    total_weight = 0
+    weighted_sum = 0
+    for idx, h in enumerate(filtered):
+        weight = (idx + 1) * h["item_count"]  
+        weighted_sum += h["avg_price"] * weight
+        total_weight += weight
+
+    if total_weight == 0:
+        return None
+
+    return weighted_sum / total_weight
 
 
 async def fetch_chunk(client: httpx.AsyncClient, item_chunk: list[str]) -> list[dict]:
@@ -153,67 +204,64 @@ async def get_arbitrage_deals():
     print(f"[ARBION] Scanning {len(ITEM_LIST)} items in {len(item_chunks)} concurrent chunks...")
 
     async with httpx.AsyncClient() as client:
-        tasks = [fetch_chunk(client, chunk) for chunk in item_chunks]
+        tasks   = [fetch_chunk(client, chunk) for chunk in item_chunks]
         results = await asyncio.gather(*tasks)
 
-    # Build price index
-    prices: dict[str, dict[str, float]] = {}
+    prices: dict[tuple, float] = {}
+
     for chunk_data in results:
         for entry in chunk_data:
-            item_id = entry.get("item_id")
+            item_id  = entry.get("item_id")
             location = entry.get("location")
-            history = entry.get("data", [])
+            history  = entry.get("data", [])
+            quality  = entry.get("quality", 1)
+
             if not item_id or not location or not history:
                 continue
-            recent = next(
-                (h for h in reversed(history) if h.get("avg_price", 0) > 0),
-                None
-            )
-            if not recent:
-                continue
-            if item_id not in prices:
-                prices[item_id] = {}
-            prices[item_id][location] = float(recent["avg_price"])
 
-    print(f"[ARBION] Price index ready: {len(prices)} items with live data")
+            if quality != 1:
+                continue
+
+            smart_price = calculate_smart_price(history)
+            if smart_price and smart_price > 0:
+                prices[(item_id, location)] = smart_price
+
+    print(f"[ARBION] Price index ready: {len(prices)} item-location pairs")
 
     # Compute arbitrage
     all_results: dict[str, dict] = {}
     for buy_city in CITIES:
-        city_deals = []
+        city_deals        = []
         total_city_profit = 0
 
         for item_id in ITEM_LIST:
-            item_prices = prices.get(item_id)
-            if not item_prices or buy_city not in item_prices:
-                continue
-            buy_price = item_prices[buy_city]
-            if buy_price <= 0:
+            buy_price = prices.get((item_id, buy_city))
+            if not buy_price or buy_price <= 0:
                 continue
 
             for sell_city in CITIES:
                 if sell_city == buy_city:
                     continue
-                sell_price = item_prices.get(sell_city, 0)
-                if sell_price <= 0:
+                sell_price = prices.get((item_id, sell_city))
+                if not sell_price or sell_price <= 0:
                     continue
 
                 net_sell = sell_price * (1 - MARKET_TAX)
-                profit = int(net_sell - buy_price)
+                profit   = int(net_sell - buy_price)
                 if profit < MIN_PROFIT:
                     continue
 
                 roi = round((profit / buy_price) * 100, 2)
                 city_deals.append({
-                    "id": item_id,
+                    "id":         item_id,
                     "human_name": get_human_name(item_id),
-                    "buy_at": buy_city,
-                    "sell_at": sell_city,
-                    "buy_price": int(buy_price),
+                    "buy_at":     buy_city,
+                    "sell_at":    sell_city,
+                    "buy_price":  int(buy_price),
                     "sell_price": int(sell_price),
-                    "profit": profit,
-                    "roi": roi,
-                    "img": f"https://render.albiononline.com/v1/item/{item_id}.png",
+                    "profit":     profit,
+                    "roi":        roi,
+                    "img":        f"https://render.albiononline.com/v1/item/{item_id}.png",
                 })
                 total_city_profit += profit
 
@@ -227,57 +275,57 @@ async def get_arbitrage_deals():
     return all_results
 
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "version": "2.4.0",
-        "items_tracked": len(ITEM_LIST),
-        "chunk_size": CHUNK_SIZE,
-        "cities": CITIES,
-
-    }
+# ── STRIPE CHECKOUT ────────────────────────────────────────────────────────
 @app.post("/create-checkout")
 async def create_checkout(request: Request):
-    body = await request.json()
+    body    = await request.json()
     user_id = body.get("user_id")
-    email = body.get("email")
+    email   = body.get("email")
 
     session = stripe.checkout.Session.create(
         payment_method_types=["card"],
         mode="subscription",
         customer_email=email,
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url="https://arbion.netlify.app?payment=success",
-        cancel_url="https://arbion.netlify.app?payment=cancelled",
+        success_url="https://arbi0n.netlify.app?payment=success",
+        cancel_url="https://arbi0n.netlify.app?payment=cancelled",
         metadata={"user_id": user_id},
     )
     return {"url": session.url}
 
 
+# ── STRIPE WEBHOOK ─────────────────────────────────────────────────────────
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
-    payload = await request.body()
+    payload    = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid webhook")
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         user_id = session["metadata"]["user_id"]
-
-        # Ενημέρωσε τη Supabase
         from supabase import create_client
-        sb = create_client(
-            "https://znzsttdyeigkfwbvocie.supabase.co",
-            "YOUR_SUPABASE_SERVICE_ROLE_KEY"  # ← όχι το anon key, το service role!
-        )
+        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
         sb.table("profiles").update({"is_pro": True}).eq("id", user_id).execute()
+        print(f"[ARBION] User {user_id} upgraded to Pro ✓")
 
     return {"status": "ok"}
 
+
+# ── HEALTH ─────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {
+        "status":        "ok",
+        "version":       "3.0.0",
+        "items_tracked": len(ITEM_LIST),
+        "chunk_size":    CHUNK_SIZE,
+        "cities":        CITIES,
+        "min_item_count": MIN_ITEM_COUNT,
+        "lookback_days":  LOOKBACK_DAYS,
+        "max_price_ratio": MAX_PRICE_RATIO,
+    }
