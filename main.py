@@ -2,6 +2,7 @@ import stripe
 import httpx
 import asyncio
 import os
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,7 +12,7 @@ STRIPE_PRICE_ID       = "price_1T7KE2KFJRX1avMl9z1D8leJ"
 SUPABASE_URL          = "https://znzsttdyeigkfwbvocie.supabase.co"
 SUPABASE_SERVICE_KEY  = os.environ.get("SUPABASE_SERVICE_KEY")
 
-app = FastAPI(title="ARBION OS", version="3.0.0")
+app = FastAPI(title="ARBION OS", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,9 +24,16 @@ app.add_middleware(
 # ── CONFIGURATION ──────────────────────────────────────────────────────────
 TIERS = ["T4", "T5", "T6", "T7", "T8"]
 
+# Τα καλύτερα items για arbitrage βάσει volume και profit consistency
 BASE_ITEMS = [
+    # High volume — πάντα έχουν deals
     "BAG", "CAPE",
     "MOUNT_HORSE", "MOUNT_OX", "MOUNT_MULE",
+    # Resources — τεράστιο volume, σταθερές τιμές
+    "PLANKS", "METALBAR", "CLOTH", "LEATHER", "STONEBLOCK",
+    # Food — guaranteed arbitrage μεταξύ πόλεων
+    "FOOD_BREAD", "FOOD_ROAST", "FOOD_SOUP",
+    # Weapons — υψηλό profit margin
     "MAIN_ARCANESTAFF", "2H_ARCANESTAFF",
     "MAIN_CURSESTAFF", "2H_CURSESTAFF",
     "MAIN_FIRESTAFF", "2H_FIRESTAFF",
@@ -41,6 +49,7 @@ BASE_ITEMS = [
     "MAIN_DAGGER", "2H_DAGGERPAIR",
     "2H_QUARTERSTAFF", "2H_CLAWSSPELL",
     "OFF_SHIELD", "OFF_TORCH",
+    # Armor
     "ARMOR_PLATE_SET1", "ARMOR_PLATE_SET2", "ARMOR_PLATE_SET3",
     "ARMOR_LEATHER_SET1", "ARMOR_LEATHER_SET2", "ARMOR_LEATHER_SET3",
     "ARMOR_CLOTH_SET1", "ARMOR_CLOTH_SET2", "ARMOR_CLOTH_SET3",
@@ -54,14 +63,11 @@ BASE_ITEMS = [
 
 CITIES             = ["Martlock", "Lymhurst", "Fort Sterling", "Bridgewatch", "Thetford", "Caerleon"]
 MARKET_TAX         = 0.06
-MIN_PROFIT         = 1500
-MAX_DEALS_PER_CITY = 30
+MIN_PROFIT         = 2000
+MAX_DEALS_PER_CITY = 50
 CHUNK_SIZE         = 50
-
-
-MIN_ITEM_COUNT     = 10   
-LOOKBACK_DAYS      = 3   
-MAX_PRICE_RATIO    = 2.5  
+MAX_PRICE_AGE_H    = 48   # αγνοούμε τιμές παλιότερες από 48 ώρες
+PLACEHOLDER_PRICE  = 999999  # Albion placeholder για "δεν υπάρχει listing"
 
 # ── NAME MAPPING ───────────────────────────────────────────────────────────
 TIER_NAMES = {
@@ -72,6 +78,9 @@ TIER_NAMES = {
 BASE_NAMES = {
     "BAG": "Bag", "CAPE": "Cape",
     "MOUNT_HORSE": "Riding Horse", "MOUNT_OX": "Transport Ox", "MOUNT_MULE": "Mule",
+    "PLANKS": "Planks", "METALBAR": "Metal Bar", "CLOTH": "Cloth",
+    "LEATHER": "Leather", "STONEBLOCK": "Stone Block",
+    "FOOD_BREAD": "Bread", "FOOD_ROAST": "Roast", "FOOD_SOUP": "Soup",
     "MAIN_ARCANESTAFF": "Arcane Staff", "2H_ARCANESTAFF": "Great Arcane Staff",
     "MAIN_CURSESTAFF": "Cursed Staff", "2H_CURSESTAFF": "Great Cursed Staff",
     "MAIN_FIRESTAFF": "Fire Staff", "2H_FIRESTAFF": "Great Fire Staff",
@@ -136,53 +145,43 @@ def chunks(lst, n):
         yield lst[i:i + n]
 
 
-# ── SMART PRICE CALCULATION ────────────────────────────────────────────────
-def calculate_smart_price(history: list[dict]) -> float | None:
-    """
-    Υπολογίζει αξιόπιστη τιμή από το history:
-    1. Φιλτράρει εγγραφές με item_count < MIN_ITEM_COUNT (αναξιόπιστες)
-    2. Παίρνει τις τελευταίες LOOKBACK_DAYS μέρες
-    3. Ελέγχει για spikes (τιμές > MAX_PRICE_RATIO * median)
-    4. Επιστρέφει weighted average (βαρύτερες οι πιο πρόσφατες μέρες)
-    """
-    if not history:
-        return None
-
-    
-    valid = [h for h in history if h.get("item_count", 0) >= MIN_ITEM_COUNT and h.get("avg_price", 0) > 0]
-    if not valid:
-        return None
-
-    
-    recent = valid[-LOOKBACK_DAYS:] if len(valid) >= LOOKBACK_DAYS else valid
-    if not recent:
-        return None
-
-    prices = [h["avg_price"] for h in recent]
-
-    sorted_prices = sorted(prices)
-    mid = len(sorted_prices) // 2
-    median = sorted_prices[mid] if len(sorted_prices) % 2 != 0 else (sorted_prices[mid-1] + sorted_prices[mid]) / 2
-
-    filtered = [h for h in recent if h["avg_price"] <= median * MAX_PRICE_RATIO and h["avg_price"] >= median / MAX_PRICE_RATIO]
-    if not filtered:
-        filtered = recent  
-
-   
-    total_weight = 0
-    weighted_sum = 0
-    for idx, h in enumerate(filtered):
-        weight = (idx + 1) * h["item_count"]  
-        weighted_sum += h["avg_price"] * weight
-        total_weight += weight
-
-    if total_weight == 0:
-        return None
-
-    return weighted_sum / total_weight
+def is_price_fresh(date_str: str) -> bool:
+    """Ελέγχει αν η τιμή είναι φρέσκια (< MAX_PRICE_AGE_H ώρες παλιά)"""
+    if not date_str:
+        return False
+    try:
+        price_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        if price_time.tzinfo is None:
+            price_time = price_time.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - price_time
+        return age < timedelta(hours=MAX_PRICE_AGE_H)
+    except Exception:
+        return False
 
 
-async def fetch_chunk(client: httpx.AsyncClient, item_chunk: list[str]) -> list[dict]:
+def is_valid_price(price: int) -> bool:
+    """Ελέγχει αν η τιμή είναι πραγματική (όχι placeholder ή 0)"""
+    return 0 < price < PLACEHOLDER_PRICE
+
+
+async def fetch_prices_chunk(client: httpx.AsyncClient, item_chunk: list[str]) -> list[dict]:
+    """Φέρνει real-time τιμές από το prices API"""
+    item_str = ",".join(item_chunk)
+    url = (
+        f"https://www.albion-online-data.com/api/v2/stats/prices/{item_str}"
+        f"?locations={CITY_STR}&qualities=1"
+    )
+    try:
+        resp = await client.get(url, timeout=40.0)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[ARBION] Prices chunk error: {e}")
+        return []
+
+
+async def fetch_history_chunk(client: httpx.AsyncClient, item_chunk: list[str]) -> list[dict]:
+    """Φέρνει history για fallback όταν δεν υπάρχουν fresh prices"""
     item_str = ",".join(item_chunk)
     url = (
         f"https://www.albion-online-data.com/api/v2/stats/history/{item_str}"
@@ -193,43 +192,93 @@ async def fetch_chunk(client: httpx.AsyncClient, item_chunk: list[str]) -> list[
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"[ARBION] Chunk error: {e}")
+        print(f"[ARBION] History chunk error: {e}")
         return []
+
+
+def get_history_price(history: list[dict]) -> float | None:
+    """Weighted average από τις τελευταίες 3 μέρες με volume weighting"""
+    if not history:
+        return None
+    valid = [h for h in history if h.get("item_count", 0) >= 5 and h.get("avg_price", 0) > 0]
+    if not valid:
+        return None
+    recent = valid[-3:] if len(valid) >= 3 else valid
+    prices = [h["avg_price"] for h in recent]
+    sorted_p = sorted(prices)
+    mid = len(sorted_p) // 2
+    median = sorted_p[mid]
+    # Φιλτράρουμε spikes: τιμές > 2x median ή < 0.5x median
+    filtered = [h for h in recent if median * 0.5 <= h["avg_price"] <= median * 2.0]
+    if not filtered:
+        filtered = recent
+    total_weight = sum(h["item_count"] for h in filtered)
+    if total_weight == 0:
+        return None
+    weighted_sum = sum(h["avg_price"] * h["item_count"] for h in filtered)
+    return weighted_sum / total_weight
+
+
+# ── GLOBAL CACHE ───────────────────────────────────────────────────────────
+# Αποθηκεύουμε το τελευταίο αποτέλεσμα για να το χρησιμοποιεί το route planner
+_last_prices: dict[tuple, float] = {}
+_last_deals:  dict[str, list]    = {}
 
 
 # ── MAIN ENDPOINT ──────────────────────────────────────────────────────────
 @app.get("/global-stats")
 async def get_arbitrage_deals():
+    global _last_prices, _last_deals
+
     item_chunks = list(chunks(ITEM_LIST, CHUNK_SIZE))
-    print(f"[ARBION] Scanning {len(ITEM_LIST)} items in {len(item_chunks)} concurrent chunks...")
+    print(f"[ARBION v4] Scanning {len(ITEM_LIST)} items — {len(item_chunks)} chunks...")
 
     async with httpx.AsyncClient() as client:
-        tasks   = [fetch_chunk(client, chunk) for chunk in item_chunks]
-        results = await asyncio.gather(*tasks)
+        # Φέρνουμε prices + history παράλληλα
+        price_tasks   = [fetch_prices_chunk(client, chunk) for chunk in item_chunks]
+        history_tasks = [fetch_history_chunk(client, chunk) for chunk in item_chunks]
+        price_results, history_results = await asyncio.gather(
+            asyncio.gather(*price_tasks),
+            asyncio.gather(*history_tasks)
+        )
 
-    prices: dict[tuple, float] = {}
+    # ── Χτίζουμε price index ──
+    prices: dict[tuple, float] = {}  # key: (item_id, city)
 
-    for chunk_data in results:
+    # 1. Πρώτα βάζουμε history prices ως base
+    for chunk_data in history_results:
         for entry in chunk_data:
             item_id  = entry.get("item_id")
             location = entry.get("location")
             history  = entry.get("data", [])
             quality  = entry.get("quality", 1)
-
-            if not item_id or not location or not history:
+            if not item_id or not location or quality != 1:
                 continue
+            h_price = get_history_price(history)
+            if h_price and h_price > 0:
+                prices[(item_id, location)] = h_price
 
-            if quality != 1:
+    # 2. Override με real-time prices αν είναι φρέσκιες και valid
+    fresh_count = 0
+    for chunk_data in price_results:
+        for entry in chunk_data:
+            item_id    = entry.get("item_id")
+            city       = entry.get("city")
+            sell_min   = entry.get("sell_price_min", 0)
+            sell_date  = entry.get("sell_price_min_date", "")
+            if not item_id or not city:
                 continue
+            if is_valid_price(sell_min) and is_price_fresh(sell_date):
+                prices[(item_id, city)] = float(sell_min)
+                fresh_count += 1
 
-            smart_price = calculate_smart_price(history)
-            if smart_price and smart_price > 0:
-                prices[(item_id, location)] = smart_price
+    print(f"[ARBION v4] {len(prices)} prices total, {fresh_count} real-time overrides")
+    _last_prices = prices
 
-    print(f"[ARBION] Price index ready: {len(prices)} item-location pairs")
-
-    # Compute arbitrage
+    # ── Arbitrage computation ──
     all_results: dict[str, dict] = {}
+    all_deals_flat: dict[str, list] = {}
+
     for buy_city in CITIES:
         city_deals        = []
         total_city_profit = 0
@@ -252,7 +301,19 @@ async def get_arbitrage_deals():
                     continue
 
                 roi = round((profit / buy_price) * 100, 2)
-                city_deals.append({
+
+                # Confidence score: πόσο αξιόπιστο είναι το deal
+                # Βασίζεται στο αν έχουμε real-time τιμές και για τις δύο πόλεις
+                buy_rt  = any(e.get("city") == buy_city  and e.get("item_id") == item_id for chunk in price_results for e in chunk)
+                sell_rt = any(e.get("city") == sell_city and e.get("item_id") == item_id for chunk in price_results for e in chunk)
+                if buy_rt and sell_rt:
+                    confidence = "HIGH"
+                elif buy_rt or sell_rt:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
+
+                deal = {
                     "id":         item_id,
                     "human_name": get_human_name(item_id),
                     "buy_at":     buy_city,
@@ -261,8 +322,10 @@ async def get_arbitrage_deals():
                     "sell_price": int(sell_price),
                     "profit":     profit,
                     "roi":        roi,
+                    "confidence": confidence,
                     "img":        f"https://render.albiononline.com/v1/item/{item_id}.png",
-                })
+                }
+                city_deals.append(deal)
                 total_city_profit += profit
 
         city_deals.sort(key=lambda x: x["profit"], reverse=True)
@@ -270,9 +333,71 @@ async def get_arbitrage_deals():
             "total": total_city_profit,
             "deals": city_deals[:MAX_DEALS_PER_CITY],
         }
+        all_deals_flat[buy_city] = city_deals[:MAX_DEALS_PER_CITY]
 
-    print(f"[ARBION] Complete. {len(all_results)} cities processed.")
+    _last_deals = all_deals_flat
+    print(f"[ARBION v4] Complete — {sum(len(v['deals']) for v in all_results.values())} total deals")
     return all_results
+
+
+# ── ROUTE PLANNER (PRO) ────────────────────────────────────────────────────
+@app.post("/route-planner")
+async def route_planner(request: Request):
+    """
+    PRO feature: δίνεις silver budget + inventory slots,
+    επιστρέφει τον βέλτιστο συνδυασμό items για μέγιστο κέρδος.
+    """
+    body   = await request.json()
+    budget = int(body.get("budget", 0))
+    slots  = int(body.get("slots", 1))
+    city   = body.get("city", "Martlock")
+
+    if budget <= 0 or slots <= 0:
+        raise HTTPException(status_code=400, detail="Invalid budget or slots")
+
+    # Παίρνουμε τα deals από cache
+    city_deals = _last_deals.get(city, [])
+    if not city_deals:
+        raise HTTPException(status_code=503, detail="No market data yet. Try again in a moment.")
+
+    # Φιλτράρουμε deals που χωράνε στο budget
+    affordable = [d for d in city_deals if d["buy_price"] <= budget]
+    if not affordable:
+        return {"route": [], "total_profit": 0, "total_cost": 0, "message": "No deals found within budget"}
+
+    # Knapsack-style: μέγιστο profit με slots constraint
+    # Για κάθε slot βρίσκουμε το καλύτερο deal που δεν ξεπερνά το remaining budget
+    selected  = []
+    remaining = budget
+    used_items = set()
+
+    for _ in range(slots):
+        best = None
+        for deal in affordable:
+            if deal["id"] in used_items:
+                continue
+            if deal["buy_price"] > remaining:
+                continue
+            if best is None or deal["profit"] > best["profit"]:
+                best = deal
+        if best is None:
+            break
+        selected.append(best)
+        used_items.add(best["id"])
+        remaining -= best["buy_price"]
+
+    total_profit = sum(d["profit"] for d in selected)
+    total_cost   = sum(d["buy_price"] for d in selected)
+    roi          = round((total_profit / total_cost * 100), 1) if total_cost > 0 else 0
+
+    return {
+        "route":        selected,
+        "total_profit": total_profit,
+        "total_cost":   total_cost,
+        "remaining":    remaining,
+        "roi":          roi,
+        "slots_used":   len(selected),
+    }
 
 
 # ── STRIPE CHECKOUT ────────────────────────────────────────────────────────
@@ -299,7 +424,6 @@ async def create_checkout(request: Request):
 async def stripe_webhook(request: Request):
     payload    = await request.body()
     sig_header = request.headers.get("stripe-signature")
-
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception:
@@ -311,7 +435,7 @@ async def stripe_webhook(request: Request):
         from supabase import create_client
         sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
         sb.table("profiles").update({"is_pro": True}).eq("id", user_id).execute()
-        print(f"[ARBION] User {user_id} upgraded to Pro ✓")
+        print(f"[ARBION] User {user_id} → Pro ✓")
 
     return {"status": "ok"}
 
@@ -320,12 +444,11 @@ async def stripe_webhook(request: Request):
 @app.get("/health")
 async def health():
     return {
-        "status":        "ok",
-        "version":       "3.0.0",
-        "items_tracked": len(ITEM_LIST),
-        "chunk_size":    CHUNK_SIZE,
-        "cities":        CITIES,
-        "min_item_count": MIN_ITEM_COUNT,
-        "lookback_days":  LOOKBACK_DAYS,
-        "max_price_ratio": MAX_PRICE_RATIO,
+        "status":         "ok",
+        "version":        "4.0.0",
+        "items_tracked":  len(ITEM_LIST),
+        "cities":         CITIES,
+        "max_price_age":  f"{MAX_PRICE_AGE_H}h",
+        "cached_prices":  len(_last_prices),
+        "cached_deals":   sum(len(v) for v in _last_deals.values()),
     }
